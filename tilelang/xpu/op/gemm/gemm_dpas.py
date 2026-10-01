@@ -159,17 +159,20 @@ class GemmDPAS(GemmBase):
                                 A_buf[tuple(A_other) + (a0 + row0 + m, a1 + ki * MICRO_K + lane)],
                             )
                 # Load B operands: repN int8 vectors. B stored (N, K): the 16
-                # consecutive bf16 along k already match the VNNI pair packing,
-                # so one 32B vload (reinterpreted to int32x8) is the operand.
+                # consecutive bf16 along k already match the VNNI pair packing.
+                # Load via an int32 alias so the codegen emits fast uint4 loads
+                # (a 16-wide ushort vload is slow on IGC).
+                B32 = tirx.decl_buffer(
+                    list(B_buf.shape[:-1]) + [B_buf.shape[-1] // 2],
+                    "int32",
+                    data=B_buf.data,
+                )
                 for ni in T.unroll(repN):
                     col0 = warp_n * wtN + ni * MICRO_N
-                    bvec = B_buf[
+                    b_all[T.ramp(ni * (MICRO_K // 2), 1, MICRO_K // 2)] = B32[
                         tuple(B_other)
-                        + (b0 + col0 + lane, T.ramp(b1 + ki * MICRO_K, 1, MICRO_K))
+                        + (b0 + col0 + lane, T.ramp((b1 + ki * MICRO_K) // 2, 1, MICRO_K // 2))
                     ]
-                    b_all[T.ramp(ni * (MICRO_K // 2), 1, MICRO_K // 2)] = T.reinterpret(
-                        T.int32 + "x8", bvec
-                    )
                 # repM x repN DPAS calls, accumulating in registers.
                 for wi in T.unroll(repM):
                     for ni in T.unroll(repN):
