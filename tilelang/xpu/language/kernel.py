@@ -6,6 +6,8 @@ from tvm import tirx
 
 from tilelang.language.kernel import KernelLaunchFrame, kernel_launch_factory, launch_kernel
 
+from .dpas import XPU_DPAS_PRELUDE
+
 __all__ = ["Kernel"]
 
 
@@ -13,11 +15,14 @@ __all__ = ["Kernel"]
 def Kernel(
     *blocks: int | tirx.PrimExpr,
     threads: int | list[int] | tuple[int, ...] | None = None,
+    prelude: str | None = None,
 ) -> KernelLaunchFrame:
     """Construct a kernel launch frame for Intel XPU: a grid of work-groups.
 
     Code inside the launch operates at the work-group level: ``T.Parallel``,
     ``T.copy`` and friends are mapped onto work-items by the compiler.
-    ``threads`` is the work-group size (default 128).
+    ``threads`` is the work-group size (default 128).  ``prelude`` is raw C
+    injected at file scope; the DPAS 2D block-IO helpers are always included.
     """
-    return launch_kernel(blocks, threads=threads)
+    full = XPU_DPAS_PRELUDE + (prelude or "")
+    return launch_kernel(blocks, threads=threads, prelude=full)

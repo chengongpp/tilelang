@@ -12,3 +12,4 @@ __tilelang_dialect__ = "xpu"
 __all__ = tuple(dict.fromkeys((*_COMMON_ALL, *_KERNEL_ALL)))
 
 del _COMMON_ALL, _KERNEL_ALL
+from .dpas import XPU_DPAS_PRELUDE  # noqa: F401

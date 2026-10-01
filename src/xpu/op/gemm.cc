@@ -46,7 +46,9 @@ struct Gemm {
     bool dtype_ok = DTypeIsBF16orFP16(op.a_->dtype) &&
                     DTypeIsBF16orFP16(op.b_->dtype) && op.c_->dtype.is_float() &&
                     op.c_->dtype.bits() == 32;
-    bool layout_ok = op.transB_;
+    // trans_B (B stored (N, K)) uses the SLM vload path; non-transposed B
+    // (stored (K, N)) uses the global-direct 2D block read path -- both DPAS.
+    bool layout_ok = !op.transA_;
     int64_t m = op.m_;
     int64_t n = op.n_;
     int64_t k = op.k_;

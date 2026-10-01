@@ -15,7 +15,12 @@ Vectors are staged through small private arrays (scalar stores with constant
 indices after unrolling, then one vector load via ``T.ramp``), which the IGC
 compiler promotes to registers.
 
-Supported in v1: A row-major (M, K) in shared, B transposed (N, K) in shared,
+Supported:
+- shared path: A row-major (M, K) in SLM, B transposed (N, K) in SLM;
+- global-direct path: A (M, K) and B (K, N) straight from global memory via
+  ``cl_intel_subgroup_2d_block_io`` reads (a-operand via plain 16b reads,
+  b-operand via the VNNI "transform" read), no SLM staging and no barriers.
+  Triggers when both operands are global-scope buffers covering full K.
 C fp32 fragment. Everything else falls back to the scalar FMA path.
 """
 
@@ -86,7 +91,7 @@ class GemmDPAS(GemmBase):
         thread_var: tirx.PrimExpr,
         mbar_phase_expr: tirx.PrimExpr | None = None,
     ):
-        trans_A = self.trans_A
+        trans_A, trans_B = self.trans_A, self.trans_B
         M, N, K = self.M, self.N, self.K
         A_region, B_region, C_region = self.ARegion, self.BRegion, self.CRegion
         A_buf, B_buf, C_buf = A_region.buffer, B_region.buffer, C_region.buffer
@@ -111,6 +116,103 @@ class GemmDPAS(GemmBase):
         B_other = [r.min for r in B_region.region[:-2]]
         C_other = [r.min for r in C_region.region[:-2]]
 
+        # ---- global-direct path: 2D block reads straight from DRAM --------
+        # A (M, K) row-major + B (K, N) row-major (trans_B=False), full K in
+        # one T.gemm call, both global scope: read XMX operands directly with
+        # cl_intel_subgroup_2d_block_io (a: plain 16b read; b: VNNI transform
+        # read).  No SLM staging, no barriers; ~54 TF vs ~26 TF for the SLM
+        # path on B60 at 4096^3.
+        def _global_direct_ok() -> bool:
+            if trans_A or trans_B:
+                return False
+            if str(a_dtype) not in ("bfloat16", "float16"):
+                return False
+            try:
+                if int(K) % MICRO_K != 0:
+                    return False
+            except Exception:
+                return False
+            scope_a = A_buf.scope() or "global"
+            scope_b = B_buf.scope() or "global"
+            if not (scope_a.startswith("global") and scope_b.startswith("global")):
+                return False
+            if len(A_region.region) != 2 or len(B_region.region) != 2:
+                return False
+            # K dim fully covered by the call (whole-K tile).
+            try:
+                if int(A_region.region[-1].extent) != int(K):
+                    return False
+                if int(B_region.region[-2].extent) != int(K):
+                    return False
+            except Exception:
+                return False
+            return True
+
+        if _global_direct_ok():
+            a_pitch = A_buf.shape[-1] * 2  # bytes per row
+            a_h = A_buf.shape[-2]
+            b_pitch = B_buf.shape[-1] * 2
+            b_h = B_buf.shape[-2]
+
+            @T.prim_func
+            def _gemm_dpas_global() -> None:
+                tx = thread_var - thread_bounds.min
+                warp_id = tx // SUBGROUP
+                lane = tx % SUBGROUP
+                warp_m = warp_id // n_warp
+                warp_n = warp_id % n_warp
+                a_all = T.alloc_local((repM * MICRO_M,), T.int16)
+                b_all = T.alloc_local((repN * MICRO_K // 2,), T.int32)
+                acc_all = T.alloc_local((repM * repN * MICRO_M,), accum_dtype)
+                for wi in T.serial(repM):
+                    for ni in T.serial(repN):
+                        for m in T.unroll(MICRO_M):
+                            if clear_accum:
+                                acc_all[(wi * repN + ni) * MICRO_M + m] = T.float32(0)
+                            else:
+                                acc_all[(wi * repN + ni) * MICRO_M + m] = C_buf[
+                                    tuple(C_other)
+                                    + (c0 + warp_m * wtM + wi * MICRO_M + m, c1 + warp_n * wtN + ni * MICRO_N + lane)
+                                ]
+                for ki in T.serial(K // MICRO_K):
+                    # A operands via plain 16b block reads: lane holds
+                    # A[m0..m0+7][k=lane] -- exactly the DPAS a operand.
+                    for wi in T.unroll(repM):
+                        y = a0 + warp_m * wtM + wi * MICRO_M
+                        x = a1 + ki * MICRO_K
+                        a_all[T.ramp(wi * MICRO_M, 1, MICRO_M)] = tirx.call_extern(
+                            T.int16 + "x8", "tl_xpu_rd_a16",
+                            A_buf.data, a_pitch, a_h, a_pitch, x, y,
+                        )
+                    # B operands via VNNI transform reads on B (K, N): lane
+                    # holds pairs (B[2j][n], B[2j+1][n]) -- the b operand.
+                    for ni in T.unroll(repN):
+                        x = b1 + warp_n * wtN + ni * MICRO_N
+                        y = b0 + ki * MICRO_K
+                        b_all[T.ramp(ni * (MICRO_K // 2), 1, MICRO_K // 2)] = tirx.call_extern(
+                            T.int32 + "x8", "tl_xpu_rd_b16",
+                            B_buf.data, b_pitch, b_h, b_pitch, x, y,
+                        )
+                    for wi in T.unroll(repM):
+                        for ni in T.unroll(repN):
+                            a8 = a_all[T.ramp(wi * MICRO_M, 1, MICRO_M)]
+                            b8 = b_all[T.ramp(ni * (MICRO_K // 2), 1, MICRO_K // 2)]
+                            aoff = (wi * repN + ni) * MICRO_M
+                            acc8 = acc_all[T.ramp(aoff, 1, MICRO_M)]
+                            acc_all[T.ramp(aoff, 1, MICRO_M)] = tirx.call_extern(
+                                accum_dtype + "x8", dpas_fn, a8, b8, acc8
+                            )
+                for wi in T.serial(repM):
+                    for ni in T.serial(repN):
+                        for m in T.unroll(MICRO_M):
+                            C_buf[
+                                tuple(C_other)
+                                + (c0 + warp_m * wtM + wi * MICRO_M + m, c1 + warp_n * wtN + ni * MICRO_N + lane)
+                            ] = acc_all[(wi * repN + ni) * MICRO_M + m]
+
+            return _Simplify(_gemm_dpas_global, inline_let=True)
+
+        # ---- shared (SLM) path -------------------------------------------------
         @T.prim_func
         def _gemm_dpas() -> None:
             tx = thread_var - thread_bounds.min
